@@ -8,6 +8,8 @@ extern crate alloc;
 
 use core::any;
 use core::borrow::Borrow;
+use core::fmt::Debug;
+use core::ops::Range;
 
 use anyhow;
 
@@ -42,19 +44,68 @@ use embedded_graphics::{
 use log::*;
 
 const TICK_INTERVAL_MS: u16 = 100u16; // milliseconds
-                                      // Sequences
+
+// Sequences
 const BLINKY_DUTY_SEQUENCE: &[u32] = &[5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 10, 9, 8];
 const BLINKY_SHUTDOWN_DUTY_SEQUENCE: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 7, 5, 4, 10];
-
 const SLEEPY_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
 const STATUS_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 3, 3, 3, 2, 2, 1, 1];
 const STATUS_SHUTDOWN_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
 
+//
 const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 1;
 
 // Pins
 const SLEEPY_LED: i32 = 7;
 const STATUS_LED: i32 = 0;
+
+// Ranges
+const HARD_TAP_WATER_RANGE: Range<u32> = 0u32..999u32;
+const DAMP_SOIL_RANGE: Range<u32> = 1000u32..1100u32;
+const MED_DAMP_SOIL_RANGE: Range<u32> = 1101u32..1300u32;
+const DRY_SOIL_RANGE: Range<u32> = 1201u32..1599u32;
+const DRY_AIR_RANGE: Range<u32> = 1600u32..2400u32;
+
+#[derive(Debug)]
+enum MoistureState {
+    TapWater(u16),
+    DampSoil(u16),
+    MediumDampSoil(u16),
+    DrySoil(u16),
+    DryAir(u16),
+    Unknown(u16),
+}
+
+#[derive(Debug)]
+enum WavelengthState {
+    Optimal(u16),
+    TooDark(u16),
+    TooBright(u16),
+}
+
+impl MoistureState {
+    fn get(reading: u16) -> Self {
+        if HARD_TAP_WATER_RANGE.contains(&(reading as u32)) {
+            MoistureState::TapWater(reading)
+        } else if DAMP_SOIL_RANGE.contains(&(reading as u32)) {
+            MoistureState::DampSoil(reading)
+        } else if MED_DAMP_SOIL_RANGE.contains(&(reading as u32)) {
+            MoistureState::MediumDampSoil(reading)
+        } else if DRY_SOIL_RANGE.contains(&(reading as u32)) {
+            MoistureState::DrySoil(reading)
+        } else if DRY_AIR_RANGE.contains(&(reading as u32)) {
+            MoistureState::DryAir(reading)
+        } else {
+            MoistureState::Unknown(reading)
+        }
+    }
+}
+
+impl WavelengthState {
+    fn get(reading: u16) -> Self {
+        Self::Optimal(reading)
+    }
+}
 
 #[no_mangle]
 fn main() {
@@ -80,7 +131,7 @@ fn main() {
 
     info!("Setting up soil check");
     let peripherals = Peripherals::take().unwrap();
-    let config = TimerConfig::default().frequency(25.kHz().into());
+    let config = TimerConfig::default().frequency(400.kHz().into());
 
     // Two LEDS, blinky and sleepy.
     let blinky_timer = Timer::new(peripherals.ledc.timer0, &config).unwrap();
@@ -108,24 +159,24 @@ fn main() {
     .unwrap();
 
     // Set up buttons for the LEDs.
-    let mut action_button = peripherals.pins.gpio1.into_input().unwrap();
+    let mut action_button = peripherals.pins.gpio8.into_input().unwrap();
     action_button.set_pull_down().unwrap();
     let mut sleep_button = peripherals.pins.gpio6.into_input().unwrap();
     sleep_button.set_pull_up().unwrap();
 
     // Moisture sensor.
-    let mut moisture_sensor = peripherals.pins.gpio3.into_analog_atten_11db().unwrap();
     let mut powered_adc = adc::PoweredAdc::new(
         peripherals.adc1,
         adc::config::Config::new().calibration(true),
     )
     .unwrap();
-    info!("setup adc");
+    let mut moisture_sensor = peripherals.pins.gpio2.into_analog_atten_11db().unwrap();
+    let mut wavelength_sensor = peripherals.pins.gpio1.into_analog_atten_11db().unwrap();
 
     // I2C
     let scl = peripherals.pins.gpio4;
     let sda = peripherals.pins.gpio5;
-    let mut display_power = peripherals.pins.gpio2.into_output().unwrap();
+    let mut display_power = peripherals.pins.gpio3.into_output().unwrap();
     display_power
         .set_drive_strength(esp_idf_hal::gpio::DriveStrength::I40mA)
         .unwrap();
@@ -171,6 +222,7 @@ fn main() {
             unsafe {
                 info!("sleeping");
                 _ = status.disable(); // we shouldn't need this.
+                _ = action_led.disable();
                 esp_idf_sys::gpio_reset_pin(SLEEPY_LED);
                 esp_idf_sys::gpio_set_direction(SLEEPY_LED, GPIO_MODE_DEF_OUTPUT);
                 FreeRtos.delay_us(500u16);
@@ -184,12 +236,23 @@ fn main() {
             info!("led button pressed");
             _ = status.disable();
             display.clear();
-            // read moisture.
-            let moisture = powered_adc.read(&mut moisture_sensor).unwrap();
-            info!("moisture: {}", moisture);
+            // Wait for a bit.
+            let wavelength =
+                WavelengthState::get(powered_adc.read(&mut wavelength_sensor).unwrap());
+            FreeRtos.delay_ms(100u32);
+            let moisture = MoistureState::get(powered_adc.read(&mut moisture_sensor).unwrap());
+            FreeRtos.delay_ms(100u32);
+            info!("moisture: {:#?}", moisture);
             draw_display_text(
                 &mut display,
-                format!("Soil Moisture: {}\nMight require watering.", moisture).as_str(),
+                format!(
+                    "Dirtplug reading\n\nearth: {:#?}\nlight: {:#?}\n{}\n{}",
+                    moisture,
+                    wavelength,
+                    get_moisture_status_message(&moisture),
+                    get_wavelength_status_message(&wavelength)
+                )
+                .as_str(),
             )
             .unwrap();
             display
@@ -243,7 +306,6 @@ where
     D::Color: From<Rgb565>,
 {
     display.clear(Rgb565::BLACK.into())?;
-
     Rectangle::new(display.bounding_box().top_left, display.bounding_box().size)
         .into_styled(
             PrimitiveStyleBuilder::new()
@@ -256,12 +318,12 @@ where
 
     Text::new(
         text,
-        Point::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
+        // oint::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
+        Point::new(10, 10),
         MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
     )
     .draw(display)?;
     info!("LED rendering done");
-
     Ok(())
 }
 
@@ -291,4 +353,23 @@ where
     .draw(display)?;
 
     Ok(())
+}
+
+fn get_moisture_status_message(status: &MoistureState) -> &'static str {
+    match *status {
+        MoistureState::DampSoil(_) => ":D",
+        MoistureState::MediumDampSoil(_) => ":)",
+        MoistureState::DrySoil(_) => ":(",
+        MoistureState::DryAir(_) => "X|",
+        MoistureState::TapWater(_) => ":|",
+        MoistureState::Unknown(_) => ":?",
+    }
+}
+
+fn get_wavelength_status_message(status: &WavelengthState) -> &'static str {
+    match *status {
+        WavelengthState::Optimal(_) => "O",
+        WavelengthState::TooBright(_) => "B",
+        WavelengthState::TooDark(_) => "D",
+    }
 }
