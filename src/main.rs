@@ -8,26 +8,29 @@ extern crate alloc;
 
 use core::any;
 use core::borrow::Borrow;
+use core::default::Default;
 use core::fmt::Debug;
 use core::ops::Range;
 
 use anyhow;
 
 use embedded_graphics::mono_font::{ascii::FONT_5X8, MonoTextStyle};
+use esp_idf_hal::i2c::config::MasterConfig;
 use hal::digital::v2::{InputPin, OutputPin};
 use hal::prelude::*;
 
 use esp_idf_hal::delay::FreeRtos;
-use esp_idf_hal::gpio::Pull;
-use esp_idf_hal::i2c;
+use esp_idf_hal::gpio::*;
+use esp_idf_hal::i2c::*;
 use esp_idf_hal::ledc::{config::TimerConfig, Channel, HwChannel, HwTimer, Timer};
 use esp_idf_hal::peripherals::{self, Peripherals};
 use esp_idf_hal::{adc, prelude::*};
 use esp_idf_sys::{
-    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH, gpio_hold_dis,
+    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH as GPIO_HIGH, gpio_hold_dis,
     GPIO_MODE_DEF_OUTPUT,
 };
 
+use ssd1306::mode::BufferedGraphicsMode;
 use ssd1306::mode::DisplayConfig;
 use ssd1306::prelude::*;
 
@@ -35,8 +38,6 @@ use embedded_graphics::geometry::*;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::{
-    pixelcolor::BinaryColor,
-    prelude::*,
     primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, Triangle},
     text::Text,
 };
@@ -53,7 +54,7 @@ const STATUS_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 3, 3,
 const STATUS_SHUTDOWN_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
 
 //
-const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 1;
+const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 3;
 
 // Pins
 const SLEEPY_LED: i32 = 7;
@@ -72,7 +73,7 @@ enum MoistureState {
     DampSoil(u16),
     MediumDampSoil(u16),
     DrySoil(u16),
-    DryAir(u16),
+    Unplugged(u16),
     Unknown(u16),
 }
 
@@ -83,8 +84,77 @@ enum WavelengthState {
     TooBright(u16),
 }
 
-impl MoistureState {
-    fn get(reading: u16) -> Self {
+struct Lights {}
+
+struct MainDisplay {
+    pub power: Gpio19<Output>,
+    handle: ssd1306::Ssd1306<
+        I2CInterface<Master<I2C0, Gpio5<Unknown>, Gpio4<Unknown>>>,
+        DisplaySize128x64,
+        BufferedGraphicsMode<DisplaySize128x64>,
+    >,
+}
+
+impl MainDisplay {
+    /// Returns an unitialized `MaindDisplay`.
+    fn from_pins(
+        i2c: I2C0,
+        scl: Gpio4<Unknown>,
+        sda: Gpio5<Unknown>,
+        power: Gpio19<Unknown>,
+    ) -> MainDisplay {
+        let handle = ssd1306::I2CDisplayInterface::new(
+            Master::<I2C0, _, _>::new(
+                i2c,
+                MasterPins { scl, sda },
+                MasterConfig::default().baudrate(400.kHz().into()),
+            )
+            .unwrap(),
+        );
+        MainDisplay {
+            power: power.into_output().expect("couldn't get hold of gpio19"),
+            handle: ssd1306::Ssd1306::new(
+                handle,
+                ssd1306::size::DisplaySize128x64,
+                ssd1306::rotation::DisplayRotation::Rotate0,
+            )
+            .into_buffered_graphics_mode(),
+        }
+    }
+
+    /// Initialize an i2c display.
+    fn initialize(&mut self) -> Result<(), ()> {
+        self.power.set_drive_strength(DriveStrength::I40mA).unwrap();
+        self.power.set_high().unwrap();
+        FreeRtos.delay_ms(100u32);
+        self.handle
+            .init()
+            .map_err(|e| info!("Display init error: {:?}", e))?;
+        self.flush();
+        Ok(())
+    }
+
+    fn clear(&mut self) -> () {
+        self.handle.clear();
+        self.flush();
+        ()
+    }
+
+    fn flush(&mut self) -> () {
+        self.handle
+            .flush()
+            .map_err(|e| info!("Flush error: {:?}", e))
+            .unwrap();
+        ()
+    }
+}
+
+struct Device {
+    status_lights: Lights,
+}
+
+impl From<u16> for MoistureState {
+    fn from(reading: u16) -> Self {
         if HARD_TAP_WATER_RANGE.contains(&(reading as u32)) {
             MoistureState::TapWater(reading)
         } else if DAMP_SOIL_RANGE.contains(&(reading as u32)) {
@@ -94,15 +164,15 @@ impl MoistureState {
         } else if DRY_SOIL_RANGE.contains(&(reading as u32)) {
             MoistureState::DrySoil(reading)
         } else if DRY_AIR_RANGE.contains(&(reading as u32)) {
-            MoistureState::DryAir(reading)
+            MoistureState::Unplugged(reading)
         } else {
             MoistureState::Unknown(reading)
         }
     }
 }
 
-impl WavelengthState {
-    fn get(reading: u16) -> Self {
+impl From<u16> for WavelengthState {
+    fn from(reading: u16) -> Self {
         Self::Optimal(reading)
     }
 }
@@ -112,7 +182,6 @@ fn main() {
     // Temporary. Will disappear once ESP-IDF 4.4 is released, but for now it is necessary to call this function once,
     // or else some patches to the runtime implemented by esp-idf-sys might not link properly.
     esp_idf_sys::link_patches();
-
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
@@ -122,16 +191,13 @@ fn main() {
         // esp_set_deep_sleep_wake_stub(Some(wake_stub));
         // Clear deep sleep holds.
         esp_idf_sys::gpio_deep_sleep_hold_dis();
-        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(
-            SLEEP_WAKEUP_PIN_MASK,
-            esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH,
-        );
+        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_HIGH);
         gpio_hold_dis(SLEEPY_LED); // Disable held state when resuming from deep sleep.
     }
 
     info!("Setting up soil check");
     let peripherals = Peripherals::take().unwrap();
-    let config = TimerConfig::default().frequency(400.kHz().into());
+    let config = TimerConfig::default().frequency(25.kHz().into());
 
     // Two LEDS, blinky and sleepy.
     let blinky_timer = Timer::new(peripherals.ledc.timer0, &config).unwrap();
@@ -159,10 +225,10 @@ fn main() {
     .unwrap();
 
     // Set up buttons for the LEDs.
-    let mut action_button = peripherals.pins.gpio8.into_input().unwrap();
+    let mut action_button = peripherals.pins.gpio3.into_input().unwrap();
     action_button.set_pull_down().unwrap();
     let mut sleep_button = peripherals.pins.gpio6.into_input().unwrap();
-    sleep_button.set_pull_up().unwrap();
+    sleep_button.set_pull_down().unwrap();
 
     // Moisture sensor.
     let mut powered_adc = adc::PoweredAdc::new(
@@ -174,48 +240,46 @@ fn main() {
     let mut wavelength_sensor = peripherals.pins.gpio1.into_analog_atten_11db().unwrap();
 
     // I2C
-    let scl = peripherals.pins.gpio4;
-    let sda = peripherals.pins.gpio5;
-    let mut display_power = peripherals.pins.gpio3.into_output().unwrap();
-    display_power
-        .set_drive_strength(esp_idf_hal::gpio::DriveStrength::I40mA)
-        .unwrap();
-    display_power.set_high().unwrap();
-    info!("set display on");
-    let config = <i2c::config::MasterConfig>::default().baudrate(400.kHz().into());
-    let display_handle = ssd1306::I2CDisplayInterface::new(
-        i2c::Master::<i2c::I2C0, _, _>::new(peripherals.i2c0, i2c::MasterPins { sda, scl }, config)
-            .unwrap(),
+    let mut display = MainDisplay::from_pins(
+        peripherals.i2c0,
+        peripherals.pins.gpio4,
+        peripherals.pins.gpio5,
+        peripherals.pins.gpio19,
     );
-    let mut display = ssd1306::Ssd1306::new(
-        display_handle,
-        ssd1306::size::DisplaySize128x64,
-        ssd1306::rotation::DisplayRotation::Rotate0,
-    )
-    .into_buffered_graphics_mode();
-    // Display clear.
-    display
-        .init()
-        .map_err(|e| info!("Display error: {:?}", e))
-        .unwrap();
+    display.initialize().unwrap();
     FreeRtos.delay_ms(30u32);
-
     display.clear();
-    draw_welcome_text(&mut display).unwrap();
-    display
-        .flush()
-        .map_err(|e| info!("Flush error: {:?}", e))
-        .unwrap();
+    draw_ready(&mut display).unwrap();
     info!("initialized display. should be on now");
 
     loop {
-        if sleep_button.is_low().unwrap() {
+        if action_button.is_high().unwrap() {
+            info!("led button pressed");
+            _ = status.disable();
+            display.clear();
+            // Wait for a bit.
+            let wavelength: WavelengthState =
+                powered_adc.read(&mut wavelength_sensor).unwrap().into();
+            FreeRtos.delay_ms(100u32);
+            let moisture: MoistureState = powered_adc.read(&mut moisture_sensor).unwrap().into();
+            FreeRtos.delay_ms(100u32);
+            info!("moisture: {:#?}", moisture);
+            draw_display_text(
+                &mut display,
+                format!(
+                    "Dirtplug reading\n\nearth: {:#?}\nlight: {:#?}\n{}\n{}",
+                    moisture,
+                    wavelength,
+                    get_moisture_status_message(&moisture),
+                    get_wavelength_status_message(&wavelength)
+                )
+                .as_str(),
+            )
+            .unwrap();
+            perform_duty_cycle(&mut action_led, BLINKY_DUTY_SEQUENCE, 50);
+        } else if sleep_button.is_high().unwrap() {
             display.clear();
             draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
-            display
-                .flush()
-                .map_err(|e| info!("Flush error: {:?}", e))
-                .unwrap();
             perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
             perform_duty_cycle(&mut sleepy, SLEEPY_DUTY_SEQUENCE, 50);
             perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 50);
@@ -231,46 +295,12 @@ fn main() {
                 esp_idf_sys::gpio_deep_sleep_hold_en();
                 esp_idf_sys::esp_deep_sleep_start();
             }
-        }
-        if action_button.is_high().unwrap() {
-            info!("led button pressed");
-            _ = status.disable();
-            display.clear();
-            // Wait for a bit.
-            let wavelength =
-                WavelengthState::get(powered_adc.read(&mut wavelength_sensor).unwrap());
-            FreeRtos.delay_ms(100u32);
-            let moisture = MoistureState::get(powered_adc.read(&mut moisture_sensor).unwrap());
-            FreeRtos.delay_ms(100u32);
-            info!("moisture: {:#?}", moisture);
-            draw_display_text(
-                &mut display,
-                format!(
-                    "Dirtplug reading\n\nearth: {:#?}\nlight: {:#?}\n{}\n{}",
-                    moisture,
-                    wavelength,
-                    get_moisture_status_message(&moisture),
-                    get_wavelength_status_message(&wavelength)
-                )
-                .as_str(),
-            )
-            .unwrap();
-            display
-                .flush()
-                .map_err(|e| info!("Flush error: {:?}", e))
-                .unwrap();
-            perform_duty_cycle(&mut action_led, BLINKY_DUTY_SEQUENCE, 50);
         } else {
             // The main action.
             _ = action_led.disable();
             perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
             display.clear();
-            draw_welcome_text(&mut display).unwrap();
-            display
-                .flush()
-                .map_err(|e| info!("Flush error: {:?}", e))
-                .unwrap();
-            info!("initialized display. should be on now");
+            draw_ready(&mut display).unwrap();
         }
         FreeRtos.delay_ms(TICK_INTERVAL_MS);
     }
@@ -300,21 +330,20 @@ where
 // }
 
 #[allow(dead_code)]
-fn draw_display_text<D>(display: &mut D, text: &str) -> Result<(), D::Error>
-where
-    D: DrawTarget + Dimensions,
-    D::Color: From<Rgb565>,
-{
-    display.clear(Rgb565::BLACK.into())?;
-    Rectangle::new(display.bounding_box().top_left, display.bounding_box().size)
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .fill_color(Rgb565::BLUE.into())
-                .stroke_color(Rgb565::YELLOW.into())
-                .stroke_width(1)
-                .build(),
-        )
-        .draw(display)?;
+fn draw_display_text(display: &mut MainDisplay, text: &str) -> Result<(), ()> {
+    Rectangle::new(
+        display.handle.bounding_box().top_left,
+        display.handle.bounding_box().size,
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .fill_color(Rgb565::BLUE.into())
+            .stroke_color(Rgb565::YELLOW.into())
+            .stroke_width(1)
+            .build(),
+    )
+    .draw(&mut display.handle)
+    .unwrap();
 
     Text::new(
         text,
@@ -322,17 +351,14 @@ where
         Point::new(10, 10),
         MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
     )
-    .draw(display)?;
+    .draw(&mut display.handle)
+    .unwrap();
     info!("LED rendering done");
     Ok(())
 }
 
-fn draw_welcome_text<D>(display: &mut D) -> Result<(), D::Error>
-where
-    D: DrawTarget + Dimensions,
-    <D as embedded_graphics::draw_target::DrawTarget>::Error: core::fmt::Debug,
-    D::Color: From<Rgb565>,
-{
+fn draw_ready(display: &mut MainDisplay) -> Result<(), ()> {
+    display.clear();
     let yoffset = 10;
     let thin_stroke = PrimitiveStyle::with_stroke(Rgb565::YELLOW.into(), 1);
     // Draw a triangle.
@@ -342,15 +368,16 @@ where
         Point::new(16 + 8, yoffset),
     )
     .into_styled(thin_stroke)
-    .draw(display)
+    .draw(&mut display.handle)
     .unwrap();
 
     Text::new(
-        "Ready da ngotha.\nPress button to measure.",
+        "Ready da ngotha.\nPress button to measure.\n<3",
         Point::new(10, 40),
         MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
     )
-    .draw(display)?;
+    .draw(&mut display.handle)
+    .unwrap();
 
     Ok(())
 }
@@ -360,7 +387,7 @@ fn get_moisture_status_message(status: &MoistureState) -> &'static str {
         MoistureState::DampSoil(_) => ":D",
         MoistureState::MediumDampSoil(_) => ":)",
         MoistureState::DrySoil(_) => ":(",
-        MoistureState::DryAir(_) => "X|",
+        MoistureState::Unplugged(_) => "X|",
         MoistureState::TapWater(_) => ":|",
         MoistureState::Unknown(_) => ":?",
     }
