@@ -23,10 +23,10 @@ use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::*;
 use esp_idf_hal::i2c::*;
 use esp_idf_hal::ledc::{config::TimerConfig, Channel, HwChannel, HwTimer, Timer};
-use esp_idf_hal::peripherals::{self, Peripherals};
+use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::{adc, prelude::*};
 use esp_idf_sys::{
-    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH as GPIO_HIGH, gpio_hold_dis,
+    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_LOW as GPIO_LOW, gpio_hold_dis,
     GPIO_MODE_DEF_OUTPUT,
 };
 
@@ -54,11 +54,11 @@ const STATUS_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 3, 3,
 const STATUS_SHUTDOWN_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
 
 //
-const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 3;
+const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 0x3;
 
 // Pins
-const SLEEPY_LED: i32 = 7;
-const STATUS_LED: i32 = 0;
+const SLEEPY_LED: i32 = 0x7;
+const STATUS_LED: i32 = 0x0;
 
 // Ranges
 const HARD_TAP_WATER_RANGE: Range<u32> = 0u32..999u32;
@@ -97,7 +97,7 @@ struct MainDisplay {
 
 impl MainDisplay {
     /// Returns an unitialized `MaindDisplay`.
-    fn from_pins(
+    fn initialize_from_pins(
         i2c: I2C0,
         scl: Gpio4<Unknown>,
         sda: Gpio5<Unknown>,
@@ -106,12 +106,12 @@ impl MainDisplay {
         let handle = ssd1306::I2CDisplayInterface::new(
             Master::<I2C0, _, _>::new(
                 i2c,
-                MasterPins { scl, sda },
+                MasterPins { sda, scl },
                 MasterConfig::default().baudrate(400.kHz().into()),
             )
             .unwrap(),
         );
-        MainDisplay {
+        let mut m = MainDisplay {
             power: power.into_output().expect("couldn't get hold of gpio19"),
             handle: ssd1306::Ssd1306::new(
                 handle,
@@ -119,19 +119,15 @@ impl MainDisplay {
                 ssd1306::rotation::DisplayRotation::Rotate0,
             )
             .into_buffered_graphics_mode(),
-        }
-    }
-
-    /// Initialize an i2c display.
-    fn initialize(&mut self) -> Result<(), ()> {
-        self.power.set_drive_strength(DriveStrength::I40mA).unwrap();
-        self.power.set_high().unwrap();
+        };
+        m.power.set_drive_strength(DriveStrength::I40mA).unwrap();
+        m.power.set_high().unwrap();
         FreeRtos.delay_ms(100u32);
-        self.handle
+        m.handle
             .init()
-            .map_err(|e| info!("Display init error: {:?}", e))?;
-        self.flush();
-        Ok(())
+            .map_err(|e| info!("Display init error: {:?}", e)).unwrap();
+        m.flush();
+        m
     }
 
     fn clear(&mut self) -> () {
@@ -191,7 +187,7 @@ fn main() {
         // esp_set_deep_sleep_wake_stub(Some(wake_stub));
         // Clear deep sleep holds.
         esp_idf_sys::gpio_deep_sleep_hold_dis();
-        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_HIGH);
+        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_LOW);
         gpio_hold_dis(SLEEPY_LED); // Disable held state when resuming from deep sleep.
     }
 
@@ -226,9 +222,9 @@ fn main() {
 
     // Set up buttons for the LEDs.
     let mut action_button = peripherals.pins.gpio3.into_input().unwrap();
-    action_button.set_pull_down().unwrap();
+    action_button.set_pull_up().unwrap();
     let mut sleep_button = peripherals.pins.gpio6.into_input().unwrap();
-    sleep_button.set_pull_down().unwrap();
+    sleep_button.set_pull_up().unwrap();
 
     // Moisture sensor.
     let mut powered_adc = adc::PoweredAdc::new(
@@ -240,24 +236,25 @@ fn main() {
     let mut wavelength_sensor = peripherals.pins.gpio1.into_analog_atten_11db().unwrap();
 
     // I2C
-    let mut display = MainDisplay::from_pins(
+    let mut display = MainDisplay::initialize_from_pins(
         peripherals.i2c0,
         peripherals.pins.gpio4,
         peripherals.pins.gpio5,
         peripherals.pins.gpio19,
     );
-    display.initialize().unwrap();
     FreeRtos.delay_ms(30u32);
     display.clear();
     draw_ready(&mut display).unwrap();
     info!("initialized display. should be on now");
 
     loop {
-        if action_button.is_high().unwrap() {
+        if action_button.is_low().unwrap() {
             info!("led button pressed");
+            draw_display_text(&mut display, "reading from sensors... :D").unwrap();
+            display.flush();
             _ = status.disable();
-            display.clear();
             // Wait for a bit.
+            FreeRtos.delay_ms(100u32);
             let wavelength: WavelengthState =
                 powered_adc.read(&mut wavelength_sensor).unwrap().into();
             FreeRtos.delay_ms(100u32);
@@ -276,10 +273,19 @@ fn main() {
                 .as_str(),
             )
             .unwrap();
+            display.flush();
             perform_duty_cycle(&mut action_led, BLINKY_DUTY_SEQUENCE, 50);
-        } else if sleep_button.is_high().unwrap() {
+            display.clear();
+        } else {
+            // The main action.
+            draw_ready(&mut display).unwrap();
+            _ = action_led.disable();
+            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
+        }
+        if sleep_button.is_low().unwrap() {
             display.clear();
             draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
+            display.flush();
             perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
             perform_duty_cycle(&mut sleepy, SLEEPY_DUTY_SEQUENCE, 50);
             perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 50);
@@ -295,13 +301,7 @@ fn main() {
                 esp_idf_sys::gpio_deep_sleep_hold_en();
                 esp_idf_sys::esp_deep_sleep_start();
             }
-        } else {
-            // The main action.
-            _ = action_led.disable();
-            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
-            display.clear();
-            draw_ready(&mut display).unwrap();
-        }
+        } 
         FreeRtos.delay_ms(TICK_INTERVAL_MS);
     }
 }
@@ -358,7 +358,6 @@ fn draw_display_text(display: &mut MainDisplay, text: &str) -> Result<(), ()> {
 }
 
 fn draw_ready(display: &mut MainDisplay) -> Result<(), ()> {
-    display.clear();
     let yoffset = 10;
     let thin_stroke = PrimitiveStyle::with_stroke(Rgb565::YELLOW.into(), 1);
     // Draw a triangle.
@@ -378,6 +377,7 @@ fn draw_ready(display: &mut MainDisplay) -> Result<(), ()> {
     )
     .draw(&mut display.handle)
     .unwrap();
+    display.flush();
 
     Ok(())
 }
