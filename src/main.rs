@@ -86,6 +86,8 @@ enum WavelengthState {
 
 struct Lights {}
 
+struct Buttons {}
+
 struct MainDisplay {
     pub power: Gpio19<Output>,
     handle: ssd1306::Ssd1306<
@@ -132,7 +134,6 @@ impl MainDisplay {
 
     fn clear(&mut self) -> () {
         self.handle.clear();
-        self.flush();
         ()
     }
 
@@ -248,10 +249,29 @@ fn main() {
     info!("initialized display. should be on now");
 
     loop {
+        if sleep_button.is_low().unwrap() {
+            draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
+            display.flush();
+            perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut sleepy, SLEEPY_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 50);
+            display.clear();
+            display.flush();
+            unsafe {
+                info!("sleeping");
+                _ = status.disable(); // we shouldn't need this.
+                _ = action_led.disable();
+                esp_idf_sys::gpio_reset_pin(SLEEPY_LED);
+                esp_idf_sys::gpio_set_direction(SLEEPY_LED, GPIO_MODE_DEF_OUTPUT);
+                FreeRtos.delay_us(500u16);
+                esp_idf_sys::gpio_output_set(1 << SLEEPY_LED, 1 << 0xf, 0, 1 << 19);
+                esp_idf_sys::gpio_hold_en(SLEEPY_LED);
+                esp_idf_sys::gpio_deep_sleep_hold_en();
+                esp_idf_sys::esp_deep_sleep_start();
+            }
+        } 
         if action_button.is_low().unwrap() {
             info!("led button pressed");
-            draw_display_text(&mut display, "reading from sensors... :D").unwrap();
-            display.flush();
             _ = status.disable();
             // Wait for a bit.
             FreeRtos.delay_ms(100u32);
@@ -278,31 +298,11 @@ fn main() {
             display.clear();
         } else {
             // The main action.
+            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
             draw_ready(&mut display).unwrap();
             _ = action_led.disable();
-            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
+            FreeRtos.delay_ms(TICK_INTERVAL_MS);
         }
-        if sleep_button.is_low().unwrap() {
-            display.clear();
-            draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
-            display.flush();
-            perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut sleepy, SLEEPY_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 50);
-            unsafe {
-                info!("sleeping");
-                _ = status.disable(); // we shouldn't need this.
-                _ = action_led.disable();
-                esp_idf_sys::gpio_reset_pin(SLEEPY_LED);
-                esp_idf_sys::gpio_set_direction(SLEEPY_LED, GPIO_MODE_DEF_OUTPUT);
-                FreeRtos.delay_us(500u16);
-                esp_idf_sys::gpio_output_set(1 << SLEEPY_LED, 1 << 0xf, 0, 0);
-                esp_idf_sys::gpio_hold_en(SLEEPY_LED);
-                esp_idf_sys::gpio_deep_sleep_hold_en();
-                esp_idf_sys::esp_deep_sleep_start();
-            }
-        } 
-        FreeRtos.delay_ms(TICK_INTERVAL_MS);
     }
 }
 
