@@ -26,8 +26,8 @@ use esp_idf_hal::ledc::{config::TimerConfig, Channel, HwChannel, HwTimer, Timer}
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::{adc, prelude::*};
 use esp_idf_sys::{
-    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_LOW as GPIO_LOW, gpio_hold_dis,
-    GPIO_MODE_DEF_OUTPUT,
+    self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH as GPIO_HIGH, gpio_hold_dis,
+    GPIO_MODE_DEF_OUTPUT
 };
 
 use ssd1306::mode::BufferedGraphicsMode;
@@ -84,9 +84,29 @@ enum WavelengthState {
     TooBright(u16),
 }
 
-struct Lights {}
+type ActionButton = Gpio3<Input>;
+type SleepButton = Gpio6<Input>;
+type UVB = Gpio1<Unknown>;
 
-struct Buttons {}
+
+struct Lights {
+}
+
+struct Buttons {
+    action: Gpio3<Unknown>,
+    sleep: Gpio6<Unknown>, 
+}
+
+struct Sensors {
+    uvb: Gpio1<Unknown>,
+    moisture: Gpio2<Unknown>,
+}
+
+impl Buttons {
+    fn initialize_from_pins(action: Gpio3<Input>, sleep: Gpio6<Input>) -> () {
+        ()
+    }
+}
 
 struct MainDisplay {
     pub power: Gpio19<Output>,
@@ -188,7 +208,7 @@ fn main() {
         // esp_set_deep_sleep_wake_stub(Some(wake_stub));
         // Clear deep sleep holds.
         esp_idf_sys::gpio_deep_sleep_hold_dis();
-        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_LOW);
+        esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_HIGH);
         gpio_hold_dis(SLEEPY_LED); // Disable held state when resuming from deep sleep.
     }
 
@@ -223,7 +243,7 @@ fn main() {
 
     // Set up buttons for the LEDs.
     let mut action_button = peripherals.pins.gpio3.into_input().unwrap();
-    action_button.set_pull_up().unwrap();
+    action_button.set_pull_down().unwrap();
     let mut sleep_button = peripherals.pins.gpio6.into_input().unwrap();
     sleep_button.set_pull_up().unwrap();
 
@@ -270,7 +290,7 @@ fn main() {
                 esp_idf_sys::esp_deep_sleep_start();
             }
         } 
-        if action_button.is_low().unwrap() {
+        if action_button.is_high().unwrap() {
             info!("led button pressed");
             _ = status.disable();
             // Wait for a bit.
