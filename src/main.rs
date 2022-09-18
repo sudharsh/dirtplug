@@ -338,7 +338,8 @@ fn main() {
                 esp_idf_sys::esp_deep_sleep_start();
             }
         } 
-        if buttons.is_action_active() {
+        if buttons.is_action_active() { 
+            display.clear();
             info!("led button pressed");
             _ = status.disable();
             // Wait for a bit.
