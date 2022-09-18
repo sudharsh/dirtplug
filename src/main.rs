@@ -22,6 +22,7 @@ use hal::prelude::*;
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::*;
 use esp_idf_hal::i2c::*;
+use esp_idf_hal::adc::{ADC1, PoweredAdc, Atten11dB};
 use esp_idf_hal::ledc::{config::TimerConfig, Channel, HwChannel, HwTimer, Timer};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::{adc, prelude::*};
@@ -92,19 +93,53 @@ type UVB = Gpio1<Unknown>;
 struct Lights {
 }
 
-struct Buttons {
-    action: Gpio3<Unknown>,
-    sleep: Gpio6<Unknown>, 
+/// A bag of sensors
+struct Sensors {
+    powered_adc: PoweredAdc<ADC1>,
+    uvb: Gpio1<Atten11dB<ADC1>>,
+    moisture: Gpio2<Atten11dB<ADC1>>,
 }
 
-struct Sensors {
-    uvb: Gpio1<Unknown>,
-    moisture: Gpio2<Unknown>,
+impl Sensors {
+    fn initialize_from_pins(adc1: ADC1, wavelength: Gpio1<Unknown>, moisture: Gpio2<Unknown>) -> Sensors {
+        let adc1 = adc::PoweredAdc::new(
+            adc1,
+            adc::config::Config::new().calibration(true),
+        ).unwrap();
+        Sensors { powered_adc: adc1, moisture: moisture.into_analog_atten_11db().unwrap(), uvb: wavelength.into_analog_atten_11db().unwrap() }
+    }
+
+    fn read_moisture(&mut self) -> MoistureState {
+        self.powered_adc.read(&mut self.moisture).unwrap().into()
+    }
+
+    fn read_wavelength(&mut self) -> WavelengthState {
+        self.powered_adc.read(&mut self.uvb).unwrap().into()
+    }
+}
+
+/// A bag of buttons
+struct Buttons {
+    action: Gpio3<Input>,
+    sleep: Gpio6<Input>, 
 }
 
 impl Buttons {
-    fn initialize_from_pins(action: Gpio3<Input>, sleep: Gpio6<Input>) -> () {
-        ()
+    /// Initialize buttons from the set of pins.
+    fn initialize_from_pins(action: Gpio3<Unknown>, sleep: Gpio6<Unknown>) -> Buttons {
+        let mut action = action.into_input().unwrap();
+        let mut sleep = sleep.into_input().unwrap();
+        action.set_pull_down().map_err(|e| info!("error setting pulldown for action: {:?}", e)).unwrap();
+        sleep.set_pull_up().map_err(|e| info!("error setting pullup for sleep: {:?}", e)).unwrap();
+        Buttons { action, sleep }
+    }
+
+    fn is_sleep_active(&self) -> bool {
+        self.sleep.is_low().unwrap()
+    }
+
+    fn is_action_active(&self) -> bool {
+        self.action.is_high().unwrap()
     }
 }
 
@@ -168,6 +203,22 @@ impl MainDisplay {
 
 struct Device {
     status_lights: Lights,
+    buttons: Buttons,
+    sensors: Sensors,    
+}
+
+impl Device {
+    fn init_from_peripherals(peripherals: Peripherals) -> Device {
+        Device { 
+            status_lights: Lights{}, 
+            buttons: Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6), 
+            sensors: Sensors::initialize_from_pins(peripherals.adc1, peripherals.pins.gpio1, peripherals.pins.gpio2),
+        }
+    }
+
+    fn moisture(&self) -> MoistureState {
+        MoistureState::Unknown(23)
+    }
 }
 
 impl From<u16> for MoistureState {
@@ -242,10 +293,7 @@ fn main() {
     .unwrap();
 
     // Set up buttons for the LEDs.
-    let mut action_button = peripherals.pins.gpio3.into_input().unwrap();
-    action_button.set_pull_down().unwrap();
-    let mut sleep_button = peripherals.pins.gpio6.into_input().unwrap();
-    sleep_button.set_pull_up().unwrap();
+    let buttons = Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6);
 
     // Moisture sensor.
     let mut powered_adc = adc::PoweredAdc::new(
@@ -269,7 +317,7 @@ fn main() {
     info!("initialized display. should be on now");
 
     loop {
-        if sleep_button.is_low().unwrap() {
+        if buttons.is_sleep_active() {
             draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
             display.flush();
             perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
@@ -290,7 +338,7 @@ fn main() {
                 esp_idf_sys::esp_deep_sleep_start();
             }
         } 
-        if action_button.is_high().unwrap() {
+        if buttons.is_action_active() {
             info!("led button pressed");
             _ = status.disable();
             // Wait for a bit.
@@ -344,30 +392,9 @@ where
     }
 }
 
-// #[no_mangle]
-// extern "C" fn wake_stub() -> () {
-//     ()
-// }
-
-#[allow(dead_code)]
 fn draw_display_text(display: &mut MainDisplay, text: &str) -> Result<(), ()> {
-    Rectangle::new(
-        display.handle.bounding_box().top_left,
-        display.handle.bounding_box().size,
-    )
-    .into_styled(
-        PrimitiveStyleBuilder::new()
-            .fill_color(Rgb565::BLUE.into())
-            .stroke_color(Rgb565::YELLOW.into())
-            .stroke_width(1)
-            .build(),
-    )
-    .draw(&mut display.handle)
-    .unwrap();
-
     Text::new(
         text,
-        // oint::new(10, (display.bounding_box().size.height - 10) as i32 / 2),
         Point::new(10, 10),
         MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
     )
