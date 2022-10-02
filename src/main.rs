@@ -321,34 +321,9 @@ fn main() {
     }
 
     info!("Setting up soil check");
+
     let peripherals = Peripherals::take().unwrap();
-    let config = TimerConfig::default().frequency(25.kHz().into());
-
-    // Two LEDS, blinky and sleepy.
-    let blinky_timer = Timer::new(peripherals.ledc.timer0, &config).unwrap();
-    let sleepy_timer = Timer::new(peripherals.ledc.timer1, &config).unwrap();
-    let status_timer = Timer::new(peripherals.ledc.timer2, &config).unwrap();
-
-    // Set up LEDs.
-    let mut action_led = Channel::new(
-        peripherals.ledc.channel0,
-        &blinky_timer,
-        peripherals.pins.gpio10,
-    )
-    .unwrap();
-    let mut sleepy = Channel::new(
-        peripherals.ledc.channel1,
-        &sleepy_timer,
-        peripherals.pins.gpio7,
-    )
-    .unwrap();
-    let mut status = Channel::new(
-        peripherals.ledc.channel2,
-        &status_timer,
-        peripherals.pins.gpio0,
-    )
-    .unwrap();
-
+    let mut lights = Lights::initialize_from_ledc(peripherals.ledc, peripherals.pins.gpio10, peripherals.pins.gpio7, peripherals.pins.gpio0);
     // Set up buttons for the LEDs.
     let buttons = Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6);
 
@@ -377,15 +352,15 @@ fn main() {
         if buttons.is_sleep_active() {
             draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
             display.flush();
-            perform_duty_cycle(&mut action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut sleepy, SLEEPY_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut lights.action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut lights.sleepy_led, SLEEPY_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut lights.status_led, STATUS_DUTY_SEQUENCE, 50);
             display.clear();
             display.flush();
             unsafe {
                 info!("sleeping");
-                _ = status.disable(); // we shouldn't need this.
-                _ = action_led.disable();
+                _ = lights.status_led.disable(); // we shouldn't need this.
+                _ = lights.action_led.disable();
                 esp_idf_sys::gpio_reset_pin(SLEEPY_LED);
                 esp_idf_sys::gpio_set_direction(SLEEPY_LED, GPIO_MODE_DEF_OUTPUT);
                 FreeRtos.delay_us(500u16);
@@ -398,7 +373,7 @@ fn main() {
         if buttons.is_action_active() {
             display.clear();
             info!("led button pressed");
-            _ = status.disable();
+            _ = lights.status_led.disable();
             // Wait for a bit.
             FreeRtos.delay_ms(100u32);
             let wavelength: WavelengthState =
@@ -420,13 +395,13 @@ fn main() {
             )
             .unwrap();
             display.flush();
-            perform_duty_cycle(&mut action_led, BLINKY_DUTY_SEQUENCE, 50);
+            perform_duty_cycle(&mut lights.action_led, BLINKY_DUTY_SEQUENCE, 50);
             display.clear();
         } else {
             // The main action.
-            perform_duty_cycle(&mut status, STATUS_DUTY_SEQUENCE, 10);
+            perform_duty_cycle(&mut lights.status_led, STATUS_DUTY_SEQUENCE, 10);
             draw_ready(&mut display).unwrap();
-            _ = action_led.disable();
+            _ = lights.action_led.disable();
             FreeRtos.delay_ms(TICK_INTERVAL_MS);
         }
     }
