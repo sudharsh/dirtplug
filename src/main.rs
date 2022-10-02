@@ -19,16 +19,19 @@ use esp_idf_hal::i2c::config::MasterConfig;
 use hal::digital::v2::{InputPin, OutputPin};
 use hal::prelude::*;
 
+use esp_idf_hal::adc::{Atten11dB, PoweredAdc, ADC1};
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::*;
 use esp_idf_hal::i2c::*;
-use esp_idf_hal::adc::{ADC1, PoweredAdc, Atten11dB};
-use esp_idf_hal::ledc::{config::TimerConfig, Channel, HwChannel, HwTimer, Timer};
+use esp_idf_hal::ledc::{
+    config::TimerConfig, Channel, HwChannel, HwTimer, Peripheral, Timer, CHANNEL0, CHANNEL1,
+    CHANNEL2, TIMER0, TIMER1, TIMER2,
+};
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::{adc, prelude::*};
 use esp_idf_sys::{
     self, esp_deepsleep_gpio_wake_up_mode_t_ESP_GPIO_WAKEUP_GPIO_HIGH as GPIO_HIGH, gpio_hold_dis,
-    GPIO_MODE_DEF_OUTPUT
+    GPIO_MODE_DEF_OUTPUT,
 };
 
 use ssd1306::mode::BufferedGraphicsMode;
@@ -85,15 +88,43 @@ enum WavelengthState {
     TooBright(u16),
 }
 
+#[derive(Debug)]
+enum LEDKind {}
+
 type ActionButton = Gpio3<Input>;
 type SleepButton = Gpio6<Input>;
 type UVB = Gpio1<Unknown>;
 
-
+/// Lights for the device.
 struct Lights {
+    action_led: Channel<CHANNEL0, TIMER0, Timer<TIMER0>, Gpio10<Unknown>>,
+    sleepy_led: Channel<CHANNEL1, TIMER1, Timer<TIMER1>, Gpio7<Unknown>>,
+    status_led: Channel<CHANNEL2, TIMER2, Timer<TIMER2>, Gpio0<Unknown>>,
 }
 
-/// A bag of sensors
+impl Lights {
+    fn initialize_from_ledc(
+        ledc: Peripheral,
+        action_pin: Gpio10<Unknown>,
+        sleep_pin: Gpio7<Unknown>,
+        status_pin: Gpio0<Unknown>,
+    ) -> Self {
+        let config = TimerConfig::default().frequency(25.kHz().into());
+
+        // Three LEDS, action, sleepy and status.
+        let action_timer = Timer::new(ledc.timer0, &config).unwrap();
+        let sleepy_timer = Timer::new(ledc.timer1, &config).unwrap();
+        let status_timer = Timer::new(ledc.timer2, &config).unwrap();
+
+        Lights {
+            action_led: Channel::new(ledc.channel0, action_timer, action_pin).unwrap(),
+            sleepy_led: Channel::new(ledc.channel1, sleepy_timer, sleep_pin).unwrap(),
+            status_led: Channel::new(ledc.channel2, status_timer, status_pin).unwrap(),
+        }
+    }
+}
+
+/// A bag of sensors.
 struct Sensors {
     powered_adc: PoweredAdc<ADC1>,
     uvb: Gpio1<Atten11dB<ADC1>>,
@@ -101,12 +132,18 @@ struct Sensors {
 }
 
 impl Sensors {
-    fn initialize_from_pins(adc1: ADC1, wavelength: Gpio1<Unknown>, moisture: Gpio2<Unknown>) -> Sensors {
-        let adc1 = adc::PoweredAdc::new(
-            adc1,
-            adc::config::Config::new().calibration(true),
-        ).unwrap();
-        Sensors { powered_adc: adc1, moisture: moisture.into_analog_atten_11db().unwrap(), uvb: wavelength.into_analog_atten_11db().unwrap() }
+    fn initialize_from_pins(
+        adc1: ADC1,
+        wavelength: Gpio1<Unknown>,
+        moisture: Gpio2<Unknown>,
+    ) -> Sensors {
+        let adc1 =
+            adc::PoweredAdc::new(adc1, adc::config::Config::new().calibration(true)).unwrap();
+        Sensors {
+            powered_adc: adc1,
+            moisture: moisture.into_analog_atten_11db().unwrap(),
+            uvb: wavelength.into_analog_atten_11db().unwrap(),
+        }
     }
 
     fn read_moisture(&mut self) -> MoistureState {
@@ -121,7 +158,7 @@ impl Sensors {
 /// A bag of buttons
 struct Buttons {
     action: Gpio3<Input>,
-    sleep: Gpio6<Input>, 
+    sleep: Gpio6<Input>,
 }
 
 impl Buttons {
@@ -129,8 +166,14 @@ impl Buttons {
     fn initialize_from_pins(action: Gpio3<Unknown>, sleep: Gpio6<Unknown>) -> Buttons {
         let mut action = action.into_input().unwrap();
         let mut sleep = sleep.into_input().unwrap();
-        action.set_pull_down().map_err(|e| info!("error setting pulldown for action: {:?}", e)).unwrap();
-        sleep.set_pull_up().map_err(|e| info!("error setting pullup for sleep: {:?}", e)).unwrap();
+        action
+            .set_pull_down()
+            .map_err(|e| info!("error setting pulldown for action: {:?}", e))
+            .unwrap();
+        sleep
+            .set_pull_up()
+            .map_err(|e| info!("error setting pullup for sleep: {:?}", e))
+            .unwrap();
         Buttons { action, sleep }
     }
 
@@ -182,7 +225,8 @@ impl MainDisplay {
         FreeRtos.delay_ms(100u32);
         m.handle
             .init()
-            .map_err(|e| info!("Display init error: {:?}", e)).unwrap();
+            .map_err(|e| info!("Display init error: {:?}", e))
+            .unwrap();
         m.flush();
         m
     }
@@ -204,20 +248,33 @@ impl MainDisplay {
 struct Device {
     status_lights: Lights,
     buttons: Buttons,
-    sensors: Sensors,    
+    sensors: Sensors,
 }
 
 impl Device {
-    fn init_from_peripherals(peripherals: Peripherals) -> Device {
-        Device { 
-            status_lights: Lights{}, 
-            buttons: Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6), 
-            sensors: Sensors::initialize_from_pins(peripherals.adc1, peripherals.pins.gpio1, peripherals.pins.gpio2),
+    fn init_from_peripherals(peripherals: Peripherals) -> Self {
+        Device {
+            status_lights: Lights::initialize_from_ledc(
+                peripherals.ledc,
+                peripherals.pins.gpio10,
+                peripherals.pins.gpio7,
+                peripherals.pins.gpio0,
+            ),
+            buttons: Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6),
+            sensors: Sensors::initialize_from_pins(
+                peripherals.adc1,
+                peripherals.pins.gpio1,
+                peripherals.pins.gpio2,
+            ),
         }
     }
 
-    fn moisture(&self) -> MoistureState {
-        MoistureState::Unknown(23)
+    fn moisture(&mut self) -> MoistureState {
+        self.sensors.read_moisture()
+    }
+
+    fn wavelength(&mut self) -> WavelengthState {
+        self.sensors.read_wavelength()
     }
 }
 
@@ -337,8 +394,8 @@ fn main() {
                 esp_idf_sys::gpio_deep_sleep_hold_en();
                 esp_idf_sys::esp_deep_sleep_start();
             }
-        } 
-        if buttons.is_action_active() { 
+        }
+        if buttons.is_action_active() {
             display.clear();
             info!("led button pressed");
             _ = status.disable();
