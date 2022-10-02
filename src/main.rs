@@ -9,7 +9,7 @@ extern crate alloc;
 use core::any;
 use core::borrow::Borrow;
 use core::default::Default;
-use core::fmt::Debug;
+use core::fmt;
 use core::ops::Range;
 
 use anyhow;
@@ -81,6 +81,19 @@ enum MoistureState {
     Unknown(u16),
 }
 
+impl fmt::Display for MoistureState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            MoistureState::DampSoil(_) => write!(f, ":D"),
+            MoistureState::MediumDampSoil(_) => write!(f, ":)"),
+            MoistureState::DrySoil(_) => write!(f, ":("),
+            MoistureState::Unplugged(_) => write!(f, "X|"),
+            MoistureState::TapWater(_) => write!(f, ":|"),
+            MoistureState::Unknown(_) => write!(f, ":?"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WavelengthState {
     Optimal(u16),
@@ -88,12 +101,15 @@ enum WavelengthState {
     TooBright(u16),
 }
 
-#[derive(Debug)]
-enum LEDKind {}
-
-type ActionButton = Gpio3<Input>;
-type SleepButton = Gpio6<Input>;
-type UVB = Gpio1<Unknown>;
+impl fmt::Display for WavelengthState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            WavelengthState::Optimal(_) => write!(f, "O"),
+            WavelengthState::TooBright(_) => write!(f, "B"),
+            WavelengthState::TooDark(_) => write!(f, "D"),
+        }
+    }
+}
 
 /// Lights for the device.
 struct Lights {
@@ -243,6 +259,43 @@ impl MainDisplay {
             .unwrap();
         ()
     }
+
+    fn draw_text(&mut self, text: &str) -> Result<(), ()> {
+        Text::new(
+            text,
+            Point::new(10, 10),
+            MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
+        )
+        .draw(&mut self.handle)
+        .unwrap();
+        info!("LED rendering done");
+        Ok(())    
+    }
+
+    fn draw_ready(&mut self) -> Result<(), ()> {
+        let yoffset = 10;
+        let thin_stroke = PrimitiveStyle::with_stroke(Rgb565::YELLOW.into(), 1);
+        // Draw a triangle.
+        Triangle::new(
+            Point::new(16, 16 + yoffset),
+            Point::new(16 + 16, 16 + yoffset),
+            Point::new(16 + 8, yoffset),
+        )
+        .into_styled(thin_stroke)
+        .draw(&mut self.handle)
+        .unwrap();
+    
+        Text::new(
+            "Ready da ngotha.\nPress button to measure.\n<3",
+            Point::new(10, 40),
+            MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
+        )
+        .draw(&mut self.handle)
+        .unwrap();
+        self.flush();
+    
+        Ok(())    
+    }
 }
 
 struct Device {
@@ -323,7 +376,12 @@ fn main() {
     info!("Setting up soil check");
 
     let peripherals = Peripherals::take().unwrap();
-    let mut lights = Lights::initialize_from_ledc(peripherals.ledc, peripherals.pins.gpio10, peripherals.pins.gpio7, peripherals.pins.gpio0);
+    let mut lights = Lights::initialize_from_ledc(
+        peripherals.ledc,
+        peripherals.pins.gpio10,
+        peripherals.pins.gpio7,
+        peripherals.pins.gpio0,
+    );
     // Set up buttons for the LEDs.
     let buttons = Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6);
 
@@ -345,12 +403,14 @@ fn main() {
     );
     FreeRtos.delay_ms(30u32);
     display.clear();
-    draw_ready(&mut display).unwrap();
+    display.draw_ready().unwrap();
     info!("initialized display. should be on now");
 
     loop {
         if buttons.is_sleep_active() {
-            draw_display_text(&mut display, "Sleeping... Bye.").unwrap();
+            display.clear();
+            display.flush();
+            display.draw_text("Sleeping... Bye.").unwrap();
             display.flush();
             perform_duty_cycle(&mut lights.action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
             perform_duty_cycle(&mut lights.sleepy_led, SLEEPY_DUTY_SEQUENCE, 50);
@@ -382,14 +442,12 @@ fn main() {
             let moisture: MoistureState = powered_adc.read(&mut moisture_sensor).unwrap().into();
             FreeRtos.delay_ms(100u32);
             info!("moisture: {:#?}", moisture);
-            draw_display_text(
-                &mut display,
-                format!(
+            display.draw_text(format!(
                     "Dirtplug reading\n\nearth: {:#?}\nlight: {:#?}\n{}\n{}",
                     moisture,
                     wavelength,
-                    get_moisture_status_message(&moisture),
-                    get_wavelength_status_message(&wavelength)
+                    &moisture,
+                    &wavelength
                 )
                 .as_str(),
             )
@@ -400,9 +458,9 @@ fn main() {
         } else {
             // The main action.
             perform_duty_cycle(&mut lights.status_led, STATUS_DUTY_SEQUENCE, 10);
-            draw_ready(&mut display).unwrap();
+            display.draw_ready().unwrap();
             _ = lights.action_led.disable();
-            FreeRtos.delay_ms(TICK_INTERVAL_MS);
+            FreeRtos.delay_ms(TICK_INTERVAL_MS + 300);
         }
     }
 }
@@ -422,61 +480,5 @@ where
     for divisor in sequence.iter() {
         _ = channel.set_duty(channel.get_max_duty() / divisor);
         FreeRtos.delay_ms(delay_ms);
-    }
-}
-
-fn draw_display_text(display: &mut MainDisplay, text: &str) -> Result<(), ()> {
-    Text::new(
-        text,
-        Point::new(10, 10),
-        MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
-    )
-    .draw(&mut display.handle)
-    .unwrap();
-    info!("LED rendering done");
-    Ok(())
-}
-
-fn draw_ready(display: &mut MainDisplay) -> Result<(), ()> {
-    let yoffset = 10;
-    let thin_stroke = PrimitiveStyle::with_stroke(Rgb565::YELLOW.into(), 1);
-    // Draw a triangle.
-    Triangle::new(
-        Point::new(16, 16 + yoffset),
-        Point::new(16 + 16, 16 + yoffset),
-        Point::new(16 + 8, yoffset),
-    )
-    .into_styled(thin_stroke)
-    .draw(&mut display.handle)
-    .unwrap();
-
-    Text::new(
-        "Ready da ngotha.\nPress button to measure.\n<3",
-        Point::new(10, 40),
-        MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
-    )
-    .draw(&mut display.handle)
-    .unwrap();
-    display.flush();
-
-    Ok(())
-}
-
-fn get_moisture_status_message(status: &MoistureState) -> &'static str {
-    match *status {
-        MoistureState::DampSoil(_) => ":D",
-        MoistureState::MediumDampSoil(_) => ":)",
-        MoistureState::DrySoil(_) => ":(",
-        MoistureState::Unplugged(_) => "X|",
-        MoistureState::TapWater(_) => ":|",
-        MoistureState::Unknown(_) => ":?",
-    }
-}
-
-fn get_wavelength_status_message(status: &WavelengthState) -> &'static str {
-    match *status {
-        WavelengthState::Optimal(_) => "O",
-        WavelengthState::TooBright(_) => "B",
-        WavelengthState::TooDark(_) => "D",
     }
 }
