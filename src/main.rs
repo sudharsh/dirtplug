@@ -1,27 +1,44 @@
+// MIT License
+//
+// Copyright (c) 2022 - Sudharshan S <sudharsh@gmail.com>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 #![no_std]
 #![no_main]
-
-extern crate embedded_hal as hal;
 
 #[macro_use]
 extern crate alloc;
 
-use core::any;
+extern crate embedded_hal as hal;
+
 use core::borrow::Borrow;
 use core::default::Default;
 use core::fmt;
 use core::ops::Range;
 
-use anyhow;
-
-use embedded_graphics::mono_font::{ascii::FONT_5X8, MonoTextStyle};
-use esp_idf_hal::i2c::config::MasterConfig;
 use hal::digital::v2::{InputPin, OutputPin};
 use hal::prelude::*;
 
 use esp_idf_hal::adc::{Atten11dB, PoweredAdc, ADC1};
 use esp_idf_hal::delay::FreeRtos;
 use esp_idf_hal::gpio::*;
+use esp_idf_hal::i2c::config::MasterConfig;
 use esp_idf_hal::i2c::*;
 use esp_idf_hal::ledc::{
     config::TimerConfig, Channel, HwChannel, HwTimer, Peripheral, Timer, CHANNEL0, CHANNEL1,
@@ -42,29 +59,26 @@ use embedded_graphics::geometry::*;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::{
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, Triangle},
+    primitives::{PrimitiveStyle, Triangle},
     text::Text,
 };
+use embedded_graphics::mono_font::{ascii::FONT_5X8, MonoTextStyle};
 
 use log::*;
 
-const TICK_INTERVAL_MS: u16 = 100u16; // milliseconds
+// Tick interval between each iteration in the simple main loop.
+const TICK_INTERVAL_MS: u16 = 100u16;
 
-// Sequences
-const BLINKY_DUTY_SEQUENCE: &[u32] = &[5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 10, 9, 8];
-const BLINKY_SHUTDOWN_DUTY_SEQUENCE: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 7, 5, 4, 10];
-const SLEEPY_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
+// Named LED Duty Sequences
+const SLEEP_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
 const STATUS_DUTY_SEQUENCE: &[u32] = &[1, 1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 3, 3, 3, 2, 2, 1, 1];
-const STATUS_SHUTDOWN_SEQUENCE: &[u32] = &[1, 1, 2, 3, 5, 8, 13, 21, 33];
-
-//
-const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 0x3;
 
 // Pins
-const SLEEPY_LED: i32 = 0x7;
-const STATUS_LED: i32 = 0x0;
+const SLEEP_LED: i32 = 0x7;
+const SLEEP_WAKEUP_PIN_MASK: u64 = 1 << 0x3;
 
-// Ranges
+// AOUT ranges from the sensor.
+// Requires calibration.
 const HARD_TAP_WATER_RANGE: Range<u32> = 0u32..999u32;
 const DAMP_SOIL_RANGE: Range<u32> = 1000u32..1100u32;
 const MED_DAMP_SOIL_RANGE: Range<u32> = 1101u32..1300u32;
@@ -94,10 +108,11 @@ impl fmt::Display for MoistureState {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 enum WavelengthState {
     Optimal(u16),
-    TooDark(u16),
+    TooDark(u16), // FIXME: better states
     TooBright(u16),
 }
 
@@ -108,6 +123,13 @@ impl fmt::Display for WavelengthState {
             WavelengthState::TooBright(_) => write!(f, "B"),
             WavelengthState::TooDark(_) => write!(f, "D"),
         }
+    }
+}
+
+impl From<u16> for WavelengthState {
+    fn from(reading: u16) -> Self {
+        Self::Optimal(reading)
+        // FIXME: Rest.
     }
 }
 
@@ -126,12 +148,10 @@ impl Lights {
         status_pin: Gpio0<Unknown>,
     ) -> Self {
         let config = TimerConfig::default().frequency(25.kHz().into());
-
         // Three LEDS, action, sleepy and status.
         let action_timer = Timer::new(ledc.timer0, &config).unwrap();
         let sleepy_timer = Timer::new(ledc.timer1, &config).unwrap();
         let status_timer = Timer::new(ledc.timer2, &config).unwrap();
-
         Lights {
             action_led: Channel::new(ledc.channel0, action_timer, action_pin).unwrap(),
             sleepy_led: Channel::new(ledc.channel1, sleepy_timer, sleep_pin).unwrap(),
@@ -241,23 +261,21 @@ impl MainDisplay {
         FreeRtos.delay_ms(100u32);
         m.handle
             .init()
-            .map_err(|e| info!("Display init error: {:?}", e))
+            .map_err(|e| info!("display init error: {:?}", e))
             .unwrap();
         m.flush();
         m
     }
 
-    fn clear(&mut self) -> () {
+    fn clear(&mut self) {
         self.handle.clear();
-        ()
     }
 
-    fn flush(&mut self) -> () {
+    fn flush(&mut self) {
         self.handle
             .flush()
-            .map_err(|e| info!("Flush error: {:?}", e))
+            .map_err(|e| info!("flush error: {:?}", e))
             .unwrap();
-        ()
     }
 
     fn draw_text(&mut self, text: &str) -> Result<(), ()> {
@@ -268,8 +286,7 @@ impl MainDisplay {
         )
         .draw(&mut self.handle)
         .unwrap();
-        info!("LED rendering done");
-        Ok(())    
+        Ok(())
     }
 
     fn draw_ready(&mut self) -> Result<(), ()> {
@@ -284,21 +301,22 @@ impl MainDisplay {
         .into_styled(thin_stroke)
         .draw(&mut self.handle)
         .unwrap();
-    
+
         Text::new(
-            "Ready da ngotha.\nPress button to measure.\n<3",
+            "Ready da ngotha.\nPress `action` button to measure.\n<3",
             Point::new(10, 40),
             MonoTextStyle::new(&FONT_5X8, Rgb565::WHITE.into()),
         )
         .draw(&mut self.handle)
         .unwrap();
         self.flush();
-    
-        Ok(())    
+
+        Ok(())
     }
 }
 
 struct Device {
+    display: MainDisplay,
     status_lights: Lights,
     buttons: Buttons,
     sensors: Sensors,
@@ -318,6 +336,12 @@ impl Device {
                 peripherals.adc1,
                 peripherals.pins.gpio1,
                 peripherals.pins.gpio2,
+            ),
+            display: MainDisplay::initialize_from_pins(
+                peripherals.i2c0,
+                peripherals.pins.gpio4,
+                peripherals.pins.gpio5,
+                peripherals.pins.gpio19,
             ),
         }
     }
@@ -349,9 +373,16 @@ impl From<u16> for MoistureState {
     }
 }
 
-impl From<u16> for WavelengthState {
-    fn from(reading: u16) -> Self {
-        Self::Optimal(reading)
+impl MoistureState {
+    fn duty_cycle(&self) -> &[u32] {
+        match *self {
+            MoistureState::TapWater(_) => &[2, 1, 2, 1, 1, 1],
+            MoistureState::DampSoil(_) => &[3, 3, 3, 3, 2, 1, 1, 3, 3, 3, 3, 1, 1, 2],
+            MoistureState::MediumDampSoil(_) => &[4, 4, 2, 2, 2, 2, 2],
+            MoistureState::DrySoil(_) => &[5, 5, 5, 5, 4, 4, 4, 3, 3],
+            MoistureState::Unknown(_) => &[50],
+            MoistureState::Unplugged(_) => &[10, 8, 8, 8, 6, 6, 66, 666, 6666],
+        }
     }
 }
 
@@ -370,97 +401,93 @@ fn main() {
         // Clear deep sleep holds.
         esp_idf_sys::gpio_deep_sleep_hold_dis();
         esp_idf_sys::esp_deep_sleep_enable_gpio_wakeup(SLEEP_WAKEUP_PIN_MASK, GPIO_HIGH);
-        gpio_hold_dis(SLEEPY_LED); // Disable held state when resuming from deep sleep.
+        gpio_hold_dis(SLEEP_LED); // Disable held state when resuming from deep sleep.
     }
 
-    info!("Setting up soil check");
-
+    info!("setting up soil check");
     let peripherals = Peripherals::take().unwrap();
-    let mut lights = Lights::initialize_from_ledc(
-        peripherals.ledc,
-        peripherals.pins.gpio10,
-        peripherals.pins.gpio7,
-        peripherals.pins.gpio0,
-    );
-    // Set up buttons for the LEDs.
-    let buttons = Buttons::initialize_from_pins(peripherals.pins.gpio3, peripherals.pins.gpio6);
-
-    // Moisture sensor.
-    let mut powered_adc = adc::PoweredAdc::new(
-        peripherals.adc1,
-        adc::config::Config::new().calibration(true),
-    )
-    .unwrap();
-    let mut moisture_sensor = peripherals.pins.gpio2.into_analog_atten_11db().unwrap();
-    let mut wavelength_sensor = peripherals.pins.gpio1.into_analog_atten_11db().unwrap();
-
-    // I2C
-    let mut display = MainDisplay::initialize_from_pins(
-        peripherals.i2c0,
-        peripherals.pins.gpio4,
-        peripherals.pins.gpio5,
-        peripherals.pins.gpio19,
-    );
+    let mut device = Device::init_from_peripherals(peripherals);
     FreeRtos.delay_ms(30u32);
-    display.clear();
-    display.draw_ready().unwrap();
-    info!("initialized display. should be on now");
-
+    device.display.clear();
+    device.display.draw_ready().unwrap();
+    info!("initialized display");
+    info!("delaying a bit");
+    FreeRtos.delay_ms(100u32);
+    // main loop with a tick.
     loop {
-        if buttons.is_sleep_active() {
-            display.clear();
-            display.flush();
-            display.draw_text("Sleeping... Bye.").unwrap();
-            display.flush();
-            perform_duty_cycle(&mut lights.action_led, BLINKY_SHUTDOWN_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut lights.sleepy_led, SLEEPY_DUTY_SEQUENCE, 50);
-            perform_duty_cycle(&mut lights.status_led, STATUS_DUTY_SEQUENCE, 50);
-            display.clear();
-            display.flush();
+        if device.buttons.is_sleep_active() {
+            device.display.clear();
+            device.display.flush();
+            device.display.draw_text("sleeping... bye.\n:O").unwrap();
+            device.display.flush();
+            perform_duty_cycle(
+                &mut device.status_lights.action_led,
+                SLEEP_DUTY_SEQUENCE,
+                50,
+            );
+            perform_duty_cycle(
+                &mut device.status_lights.sleepy_led,
+                SLEEP_DUTY_SEQUENCE,
+                50,
+            );
+            perform_duty_cycle(
+                &mut device.status_lights.status_led,
+                SLEEP_DUTY_SEQUENCE,
+                50,
+            );
+            device.display.clear();
+            device.display.flush();
             unsafe {
                 info!("sleeping");
-                _ = lights.status_led.disable(); // we shouldn't need this.
-                _ = lights.action_led.disable();
-                esp_idf_sys::gpio_reset_pin(SLEEPY_LED);
-                esp_idf_sys::gpio_set_direction(SLEEPY_LED, GPIO_MODE_DEF_OUTPUT);
+                _ = device.status_lights.status_led.disable(); // we shouldn't need this.
+                _ = device.status_lights.action_led.disable();
+                esp_idf_sys::gpio_reset_pin(SLEEP_LED);
+                esp_idf_sys::gpio_set_direction(SLEEP_LED, GPIO_MODE_DEF_OUTPUT);
                 FreeRtos.delay_us(500u16);
-                esp_idf_sys::gpio_output_set(1 << SLEEPY_LED, 1 << 0xf, 0, 1 << 19);
-                esp_idf_sys::gpio_hold_en(SLEEPY_LED);
+                esp_idf_sys::gpio_output_set(1 << SLEEP_LED, 1 << 0xf, 0, 1 << 19);
+                esp_idf_sys::gpio_hold_en(SLEEP_LED);
                 esp_idf_sys::gpio_deep_sleep_hold_en();
                 esp_idf_sys::esp_deep_sleep_start();
             }
         }
-        if buttons.is_action_active() {
-            display.clear();
+        if device.buttons.is_action_active() {
+            device.display.clear();
             info!("led button pressed");
-            _ = lights.status_led.disable();
+            _ = device.status_lights.status_led.disable();
             // Wait for a bit.
             FreeRtos.delay_ms(100u32);
-            let wavelength: WavelengthState =
-                powered_adc.read(&mut wavelength_sensor).unwrap().into();
+            let wavelength: WavelengthState = device.wavelength();
             FreeRtos.delay_ms(100u32);
-            let moisture: MoistureState = powered_adc.read(&mut moisture_sensor).unwrap().into();
+            let moisture: MoistureState = device.moisture();
             FreeRtos.delay_ms(100u32);
             info!("moisture: {:#?}", moisture);
-            display.draw_text(format!(
-                    "Dirtplug reading\n\nearth: {:#?}\nlight: {:#?}\n{}\n{}",
-                    moisture,
-                    wavelength,
-                    &moisture,
-                    &wavelength
+            device
+                .display
+                .draw_text(
+                    format!(
+                        "dirtplug reading\n\nmoisture: {:#?} - {}\nwavelength: {:#?} - {}",
+                        moisture, &moisture, wavelength, &wavelength
+                    )
+                    .as_str(),
                 )
-                .as_str(),
-            )
-            .unwrap();
-            display.flush();
-            perform_duty_cycle(&mut lights.action_led, BLINKY_DUTY_SEQUENCE, 50);
-            display.clear();
+                .unwrap();
+            device.display.flush();
+            perform_duty_cycle(
+                &mut device.status_lights.action_led,
+                moisture.duty_cycle(),
+                50,
+            );
+            device.display.clear();
         } else {
             // The main action.
-            perform_duty_cycle(&mut lights.status_led, STATUS_DUTY_SEQUENCE, 10);
-            display.draw_ready().unwrap();
-            _ = lights.action_led.disable();
-            FreeRtos.delay_ms(TICK_INTERVAL_MS + 300);
+            perform_duty_cycle(
+                &mut device.status_lights.status_led,
+                STATUS_DUTY_SEQUENCE,
+                10,
+            );
+            device.display.draw_ready().unwrap();
+            _ = device.status_lights.action_led.disable();
+            FreeRtos.delay_ms(TICK_INTERVAL_MS);
         }
     }
 }
@@ -469,8 +496,7 @@ fn perform_duty_cycle<C, H, T, P>(
     channel: &mut Channel<C, H, T, P>,
     sequence: &[u32],
     delay_ms: u16,
-) -> ()
-where
+) where
     C: HwChannel,
     H: HwTimer,
     T: Borrow<Timer<H>>,

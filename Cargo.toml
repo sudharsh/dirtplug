@@ -1,5 +1,5 @@
 [package]
-name = "flywheel"
+name = "dirtplug"
 version = "0.1.0"
 authors = ["Sudharshan S <sudharsh@gmail.com>"]
 edition = "2021"
