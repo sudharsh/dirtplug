@@ -22,6 +22,8 @@
 #![no_std]
 #![no_main]
 
+// FIXME: Currently littered with unwraps. Clean this up.
+
 #[macro_use]
 extern crate alloc;
 
